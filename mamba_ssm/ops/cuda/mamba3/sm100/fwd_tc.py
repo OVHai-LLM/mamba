@@ -139,12 +139,20 @@ def entering_states(ext, k, v, k_bias, mimo_v, x, NC, meta, S, H):
     ext.chunk_state(k.view(S, R, N), v.view(S, H, P), k_bias, mimo_v, x["thl"], x["dacs"], x["ts"], x["dtot"],
                     meta["start"], meta["len"], sloc, NC)
     sint = torch.empty(NC, H, P, N, device=dev, dtype=torch.float32)
-    # serial over a sequence's chunks: narrow P slices for long sequences (more programs, shorter steps)
+    # serial over a sequence's chunks: for long sequences, the widest P slices that still give ~2k programs (narrow
+    # slices: more programs, shorter steps; wide: fewer, better-pipelined steps). GB300, H=48, 64k packed tokens
+    # (longest sequence 60 chunks): PB 4 -> 32, 0.46 -> 0.18 ms.
     long_seq = meta["max_nc"] >= 32
-    PB = 4 if long_seq else 16
+    if long_seq:
+        PB = 4
+        while PB < 32 and H * meta["NS"] * (P // (2 * PB)) >= 2048:
+            PB *= 2
+        nw = {4: 1, 8: 2}.get(PB, 4)
+    else:
+        PB, nw = 16, 2
     _state_pass_kernel[(H, meta["NS"], P // PB)](sloc, x["dtot"], x["asum"], x["ain"], meta["seq_c0"], meta["seq_nc"],
                                                 sint, H,
-                                                N=N, P=P, NQ=NQ, PB=PB, num_warps=1 if long_seq else 2)
+                                                N=N, P=P, NQ=NQ, PB=PB, num_warps=nw)
     return sint
 
 
