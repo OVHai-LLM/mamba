@@ -79,6 +79,8 @@ struct __align__(1024) Smem {
   alignas(16) float ainb[2][NQ];                                // base phase of the sub-block's forward chunk
   alignas(16) float red[3][QC][ROWS];
   float dfi[4][C];             // intra part of the trapezoid factor gradient per token, per row quarter (q masks)
+  float redk[QC][ROWS];        // kv side: inter part of the trapezoid factor gradient
+  float ddk[THREADS / 32];     // kv side: dD partials per warp
   float xr[THREADS / 32 + 4];
   unsigned long long tA, tB, m1, m2a, m2b, mk1, mk2;
   uint32_t tmem_base;
@@ -264,7 +266,8 @@ template <int MODE>
 __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_constant__ Maps maps, const Args a) {
   extern __shared__ unsigned char smem_raw[];
   Smem& S = *reinterpret_cast<Smem*>(smem_raw + ((1024 - (smem_u32(smem_raw) & 1023)) & 1023));
-  Red& RD = *reinterpret_cast<Red*>(S.gw);
+  Red& RDQ = *reinterpret_cast<Red*>(S.gw);           // q-side reduction buffers (gw, first tile)
+  Red& RDK = *reinterpret_cast<Red*>(S.gw + TILE);    // kv-side (second tile)
   __nv_bfloat16* const dpw = S.sth;  // dP * W: sth | dpwb (two adjacent tiles)
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, H = a.H, NB = a.NB;
   if (blockIdx.x >= NB) return;
@@ -769,9 +772,10 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
           if (tid == 0 && has_next) { issue_a(nb_, nh_); issue_b(nb_, nh_); }
           tc_fence_after();
         }
+        Red& RD = QS ? RDQ : RDK;
         *reinterpret_cast<float2*>(&RD.g1[q4][rank][gcol]) = make_float2(g1[0], g1[1]);
         if (QS) *reinterpret_cast<float2*>(&RD.g2[q4][rank][gcol]) = make_float2(g2[0], g2[1]);
-        if (!QS && lane == 0) S.red[1][cq][32 * q4] = pdl;  // dD partial of this warp (red[1] is free on the kv side)
+        if (!QS && lane == 0) S.ddk[warp] = pdl;  // dD partial of this warp
         {  // dq (dk): rotated pairs j in [JW cq, JW cq + JW) and the plain columns 32 + JW cq.., 96 + JW cq..
           float d0[JW], d1[JW], p0v[JW], p1v[JW];
           tmem_ldw<JW>(tl + TD + JW * cq, d0);
@@ -819,58 +823,65 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
             *reinterpret_cast<float4*>(&RD.bias[q4][rank][col]) = make_float4(bf[0], bf[1], bf[2], bf[3]);
           }
         }
-        S.red[2][cq][row] = sc3;
-        if (!QS) STAMP(13);
+        if (QS) {  // the q side's per-token sums and accumulators run with the kv side's, at the end of the item
+          S.red[2][cq][row] = sc3;
+          return;
+        }
+        S.redk[cq][row] = sc3;
+        STAMP(13);
         __syncthreads();
-        if (cq == 0) {  // per-token sums (sum over the column groups, then over the ranks)
-          float v1 = 0.f, v2 = 0.f;
+        if (cq == 0) {  // per-token sums (sum over the column groups, then over the ranks), both sides
+          float v1 = 0.f, v2 = 0.f, vk = 0.f;
 #pragma unroll
           for (int g = 0; g < QC; ++g) {
-            v1 += QS ? S.red[0][g][row] + S.red[2][g][row] : S.red[2][g][row];  // q: dl row (intra + inter); kv: inter
-            if (QS) v2 += S.red[1][g][row];
+            v1 += S.red[0][g][row] + S.red[2][g][row];  // q: dl row (intra + inter)
+            v2 += S.red[1][g][row];                     // q: diagonal (gamma)
+            vk += S.redk[g][row];                       // kv: inter part of dfactor
           }
+          const float xc0 = vk;
 #pragma unroll
           for (int m = 1; m <= 2; m <<= 1) {
             v1 += __shfl_xor_sync(0xffffffffu, v1, m);
-            if (QS) v2 += __shfl_xor_sync(0xffffffffu, v2, m);
+            v2 += __shfl_xor_sync(0xffffffffu, v2, m);
+            vk += __shfl_xor_sync(0xffffffffu, vk, m);
           }
           if (okr && rank == 0) {
             const long o = (long)h * a.S + t0 + tok;
-            if (QS) { a.dlrow[o] = v1; a.dgam[o] = v2; }
-            else a.dfac[o] = v1 + ((S.dfi[0][tok] + S.dfi[1][tok]) + S.dfi[2][tok]) + S.dfi[3][tok];
+            a.dlrow[o] = v1;
+            a.dgam[o] = v2;
+            a.dfac[o] = vk + ((S.dfi[0][tok] + S.dfi[1][tok]) + S.dfi[2][tok]) + S.dfi[3][tok];
           }
-          if (!QS) {  // <Sloc_b, D_b> = sum_s f_s exp(l_end - l_s) kD_s . PsiV_s (the inter part of dfactor, times f)
-            float xc = 0.f;
+          // <Sloc_b, D_b> = sum_s f_s exp(l_end - l_s) kD_s . PsiV_s (the inter part of dfactor, times f)
+          float xc = okr ? xc0 * ffv[tok] : 0.f;
 #pragma unroll
-            for (int g = 0; g < QC; ++g) xc += S.red[2][g][row];
-            xc = okr ? xc * ffv[tok] : 0.f;
-#pragma unroll
-            for (int m = 1; m <= 16; m <<= 1) xc += __shfl_xor_sync(0xffffffffu, xc, m);
-            if (lane == 0) S.xr[THREADS / 32 + q4] = xc;
-          }
+          for (int m = 1; m <= 16; m <<= 1) xc += __shfl_xor_sync(0xffffffffu, xc, m);
+          if (lane == 0) S.xr[THREADS / 32 + q4] = xc;
         }
         {  // per (CTA, head) accumulators: fixed summation order, one owning thread per address (deterministic)
-          float* acc = (QS ? a.accq : a.acck) + ((long)blockIdx.x * H + h) * NACC;
+          float* accq = a.accq + ((long)blockIdx.x * H + h) * NACC;
+          float* acck = a.acck + ((long)blockIdx.x * H + h) * NACC;
           for (int j = tid; j < R * N; j += THREADS) {
             const int r_ = j >> 7, n = j & 127;
-            red_add(acc + j, ((RD.bias[0][r_][n] + RD.bias[1][r_][n]) + RD.bias[2][r_][n]) + RD.bias[3][r_][n]);
+            red_add(accq + j, ((RDQ.bias[0][r_][n] + RDQ.bias[1][r_][n]) + RDQ.bias[2][r_][n]) + RDQ.bias[3][r_][n]);
+            red_add(acck + j, ((RDK.bias[0][r_][n] + RDK.bias[1][r_][n]) + RDK.bias[2][r_][n]) + RDK.bias[3][r_][n]);
           }
           for (int j = tid; j < R * P; j += THREADS) {
             const int r_ = j >> 6, p = j & 63;
-            red_add(acc + R * N + j, ((RD.g1[0][r_][p] + RD.g1[1][r_][p]) + RD.g1[2][r_][p]) + RD.g1[3][r_][p]);
-            if (QS) red_add(acc + R * N + R * P + j, ((RD.g2[0][r_][p] + RD.g2[1][r_][p]) + RD.g2[2][r_][p]) + RD.g2[3][r_][p]);
+            red_add(accq + R * N + j, ((RDQ.g1[0][r_][p] + RDQ.g1[1][r_][p]) + RDQ.g1[2][r_][p]) + RDQ.g1[3][r_][p]);
+            red_add(accq + R * N + R * P + j, ((RDQ.g2[0][r_][p] + RDQ.g2[1][r_][p]) + RDQ.g2[2][r_][p]) + RDQ.g2[3][r_][p]);
+            red_add(acck + R * N + j, ((RDK.g1[0][r_][p] + RDK.g1[1][r_][p]) + RDK.g1[2][r_][p]) + RDK.g1[3][r_][p]);
           }
-          if (!QS && tid == 0) {
+          if (tid == 0) {
             float s = 0.f;
             for (int g = 0; g < QC; ++g)
-              for (int w = 0; w < 4; ++w) s += S.red[1][g][32 * w];
-            red_add(acc + R * N + 2 * R * P, s);
+              for (int w = 0; w < 4; ++w) s += S.ddk[4 * g + w];
+            red_add(acck + R * N + 2 * R * P, s);
           }
         }
         tc_fence_before();
         __syncthreads();
-        if (!QS) STAMP(14);
-        if (!QS && tid == 0) {  // fixed order (deterministic)
+        STAMP(14);
+        if (tid == 0) {  // fixed order (deterministic)
           float c = 0.f;
 #pragma unroll
           for (int i = 0; i < THREADS / 32 + 4; ++i) c += S.xr[i];
