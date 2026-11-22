@@ -556,7 +556,7 @@ def _scan_blocks_kernel(OFFSET, FINAL, BLOCK_TOT, INIT, CU, nblk, nheads, dim,
 
 @triton.jit
 def _bwd_block_kernel(GRAD_ANGLE, GRAD_DT, BLOCK_TOT, OFFSET, GRAD_OUT, ANGLE, DT, CU, ns,
-                      s_ang_seq, s_ang_head, s_dt_head, s_dt_seq, nblk,
+                      s_ang_seq, s_ang_head, s_dt_head, s_dt_seq, nblk, s_a_seq, s_a_head,
                       dim, PASS: tl.constexpr, CHUNK: tl.constexpr, BLK_CHUNKS: tl.constexpr, BLOCK_D: tl.constexpr):
     h = tl.program_id(0)
     b = tl.program_id(1)
@@ -590,7 +590,7 @@ def _bwd_block_kernel(GRAD_ANGLE, GRAD_DT, BLOCK_TOT, OFFSET, GRAD_OUT, ANGLE, D
             csum = tl.sum(g, axis=0)
             rev = csum[None, :] - tl.cumsum(g, axis=0) + g
             gv = rev + gstate[None, :]
-            pre = tl.load(ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], mask=m2, other=0.0).to(tl.float32)
+            pre = tl.load(ANGLE + tok[:, None] * s_a_seq + h * s_a_head + d[None, :], mask=m2, other=0.0).to(tl.float32)
             a = _tanh(pre) * PI_C
             dtv = tl.load(DT + h * s_dt_head + tok * s_dt_seq, mask=sm, other=0.0).to(tl.float32)
             tl.store(GRAD_ANGLE + tok[:, None] * s_ang_seq + h * s_ang_head + d[None, :], gv * dtv[:, None] * PI_C * _sech2(pre), mask=m2)
@@ -628,18 +628,27 @@ def _angle_dt_fwd_seq_parallel(angle: Tensor, dt: Tensor, init_state: Optional[T
 
 
 def _angle_dt_bwd_seq_parallel(grad_out: Tensor, angle: Tensor, dt: Tensor, has_init_state: bool = False, chunk_size: int = 16,
-                     grad_output_state: Optional[Tensor] = None, cu_seqlens: Optional[Tensor] = None, blk_chunks: int = 64):
-    angle, dt, cu, seqlen, nheads, dim, nblk = _prep(angle, dt, cu_seqlens, chunk_size, blk_chunks)
+                     grad_output_state: Optional[Tensor] = None, cu_seqlens: Optional[Tensor] = None, blk_chunks: Optional[int] = None):
+    blk_chunks = blk_chunks or max(1, 1024 // chunk_size)  # ~1024-token blocks
+    # the angles may be a view broadcast over the heads (stride 0): read in place, the gradient is dense
+    assert angle.shape[0] == 1 and cu_seqlens is not None, "varlen layout only"
+    ang_in = angle if angle.stride(-1) == 1 else angle.contiguous()
+    dt = dt.contiguous()
+    _, seqlen, nheads, dim = ang_in.shape
+    cu = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
+    nblk = seqlen // (chunk_size * blk_chunks) + cu.numel() - 1
     grad_out = grad_out.contiguous()
     ns = cu.numel() - 1
     BD = triton.next_power_of_2(dim)
-    grad_angle = torch.empty_like(angle)
+    grad_angle = torch.empty(ang_in.shape, device=ang_in.device, dtype=ang_in.dtype)
     grad_dt = torch.empty_like(dt)
     tot = torch.empty(nheads, nblk, BD, device=angle.device, dtype=torch.float32)
     off = torch.empty_like(tot)
     ginit = torch.empty(ns, nheads, dim, device=angle.device, dtype=torch.float32)
-    common = dict(s_ang_seq=angle.stride(1), s_ang_head=angle.stride(2), s_dt_head=dt.stride(1), s_dt_seq=dt.stride(2),
-                  nblk=nblk, dim=dim, CHUNK=chunk_size, BLK_CHUNKS=blk_chunks, BLOCK_D=BD)
+    common = dict(s_ang_seq=grad_angle.stride(1), s_ang_head=grad_angle.stride(2), s_dt_head=dt.stride(1),
+                  s_dt_seq=dt.stride(2), nblk=nblk, s_a_seq=ang_in.stride(1), s_a_head=ang_in.stride(2), dim=dim,
+                  CHUNK=chunk_size, BLK_CHUNKS=blk_chunks, BLOCK_D=BD)
+    angle = ang_in
     _bwd_block_kernel[(nheads, nblk)](grad_angle, grad_dt, tot, off, grad_out, angle, dt, cu, ns, PASS=1, **common)
     gos = grad_output_state.contiguous().float() if grad_output_state is not None else ginit
     _scan_blocks_kernel[(nheads, ns)](off, ginit, tot, gos, cu, nblk, nheads, dim,

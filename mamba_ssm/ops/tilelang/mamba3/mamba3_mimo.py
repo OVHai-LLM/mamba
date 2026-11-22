@@ -93,6 +93,10 @@ class _Mamba3Function(torch.autograd.Function):
             and Input_V_State is None
         )
         assert all_states_present or all_states_absent, "Input states must be provided together or all be None."
+        # Angles broadcast over the heads (a stride-0 head dimension, e.g. angle.expand(..., H, ...)) stay a view on
+        # the sm100 path (its kernels take the strides): no [S, H, NQ] fp32 copy, nor its saved activation.
+        angles_view = Angles if (Angles.dim() == 4 and Angles.stride(2) == 0 and Angles.stride(3) == 1
+                                 and Angles.dtype == torch.float32) else None
         (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, MIMO_V, MIMO_Z, MIMO_Out, Out_Norm_Weight, Angles, D, Z,
             Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State) = tuple(
             t.contiguous() if t is not None else None
@@ -119,6 +123,8 @@ class _Mamba3Function(torch.autograd.Function):
             # 256-token chunk, Angle_Base the chunk's entering phase (both for the backward)
             from mamba_ssm.ops.cuda.mamba3.sm100 import fwd_tc
             ctx.scan_block = 0
+            if angles_view is not None:
+                Angles = angles_view
             Out, Angles_Cumsum, Angle_Base = fwd_tc.fwd(Q, K, V, Q_bias, K_bias, MIMO_V, MIMO_Out, Z, D, MIMO_Z, Angles,
                                                         ADT, DT, Trap, cu_host_list(cu_seqlens))
         else:
@@ -308,7 +314,7 @@ class _Mamba3Function(torch.autograd.Function):
             angle=Angles,
             dt=DT,
             has_init_state=False,
-            chunk_size=ctx.chunk_size,
+            chunk_size=64 if ctx.sm100 else ctx.chunk_size,  # the chunk only tiles the sequence-parallel kernels
             cu_seqlens=cu_seqlens,
         )
         dDT = dDT + dDT_angle

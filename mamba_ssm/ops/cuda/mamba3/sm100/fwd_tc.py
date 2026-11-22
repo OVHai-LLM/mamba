@@ -33,7 +33,7 @@ def _wrap(x):
 
 @triton.jit
 def _prep_kernel(ADT, DT, TRAP, ANG, CH_START, CH_LEN, CH_SEND,
-                 DACS, TS, GAM, DTOT, DCS32, DCSR32, THL, ASUM, S, H,
+                 DACS, TS, GAM, DTOT, DCS32, DCSR32, THL, ASUM, S, H, s_ang_t, s_ang_h,
                  LS: tl.constexpr, G: tl.constexpr, NQ: tl.constexpr):
     c = tl.program_id(0)
     h = tl.program_id(1)
@@ -67,7 +67,7 @@ def _prep_kernel(ADT, DT, TRAP, ANG, CH_START, CH_LEN, CH_SEND,
     for g in tl.static_range(LS // G):
         tg = cs + g * G + ig
         mg = (g * G + ig) < cl
-        a = tl.load(ANG + (tg[:, None] * H + h) * NQ + nq[None, :], mask=mg[:, None], other=0.0)
+        a = tl.load(ANG + tg[:, None].to(tl.int64) * s_ang_t + h * s_ang_h + nq[None, :], mask=mg[:, None], other=0.0)
         dg = tl.load(DT + h * S + tg, mask=mg, other=0.0)
         inc = (tl.sigmoid(2.0 * a) * 2.0 - 1.0) * 3.141592653589793 * dg[:, None]
         tl.store(THL + (tg[:, None] * H + h) * NQ + nq[None, :], _wrap(tl.cumsum(inc, axis=0) + carry[None, :]),
@@ -118,7 +118,9 @@ def _state_pass_kernel(SLOC, DTOT, ASUM, AIN, SEQ_C0, SEQ_NC, SINT, H,
 
 
 def prep(adt, dt, trap, angles, NC, meta, S, H):
-    """The per-chunk prep tensors (see the module docstring); ``angles`` are the raw angles [S, H, NQ]."""
+    """The per-chunk prep tensors (see the module docstring); ``angles`` are the raw angles [.., S, H, NQ] (unit
+    stride over NQ; any token / head strides, e.g. 0 for angles broadcast over the heads)."""
+    assert angles.stride(-1) == 1 and angles.shape[-3:] == (S, H, NQ)
     dev = adt.device
     f32 = dict(device=dev, dtype=torch.float32)
     x = dict(dacs=torch.empty(H, S, **f32), ts=torch.empty(H, S, **f32), gam=torch.empty(H, S, **f32),
@@ -126,7 +128,7 @@ def prep(adt, dt, trap, angles, NC, meta, S, H):
              thl=torch.empty(S, H, NQ, **f32), asum=torch.empty(NC, H, NQ, **f32), ain=torch.empty(NC, H, NQ, **f32))
     _prep_kernel[(NC, H)](adt, dt, trap, angles, meta["start"], meta["len"], meta["send"],
                           x["dacs"], x["ts"], x["gam"], x["dtot"], x["dcs32"], x["dcsr32"], x["thl"], x["asum"], S, H,
-                          LS=LS, G=G32, NQ=NQ, num_warps=2)
+                          angles.stride(-3), angles.stride(-2), LS=LS, G=G32, NQ=NQ, num_warps=2)
     return x
 
 
@@ -160,7 +162,9 @@ def fwd(q, k, v, q_bias, k_bias, mimo_v, mimo_o, z, D, mimo_z, angles, adt, dt, 
     trap = trap.reshape(H, S).contiguous()
     f32 = lambda t: t.float().contiguous()  # noqa: E731
     q_bias, k_bias, mimo_v, mimo_o, mimo_z, D = map(f32, (q_bias, k_bias, mimo_v, mimo_o, mimo_z, D))
-    x = prep(adt, dt, trap, angles.float().contiguous(), NC, meta, S, H)
+    if angles.dtype != torch.float32 or angles.stride(-1) != 1:
+        angles = angles.float().contiguous()
+    x = prep(adt, dt, trap, angles, NC, meta, S, H)
     sint = entering_states(ext, k, v, k_bias, mimo_v, x, NC, meta, S, H)
     k_fin = torch.empty(NC, R, H, N, device=v.device, dtype=q.dtype)
     ext.scan(q.view(S, R, N), k.view(S, R, N), v.view(S, H, P), z.view(S, H, P), q_bias, k_bias, mimo_v, mimo_o, mimo_z,

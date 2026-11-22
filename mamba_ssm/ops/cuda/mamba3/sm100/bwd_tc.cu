@@ -241,7 +241,7 @@ struct Args {
   unsigned long long* prof;            // optional phase stamps (block 0, first 64 items)
 };
 
-#define STAMP(k) do { if (a.prof && blockIdx.x == 0 && tid == 0 && it < 64) a.prof[it * 16 + (k)] = gtime(); } while (0)
+#define STAMP(k) do { if (a.prof && blockIdx.x == 0 && tid == 0 && it < 64) a.prof[(MODE * 64 + it) * 16 + (k)] = gtime(); } while (0)
 template <int MODE>
 __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constant__ Maps maps, const Args a) {
   extern __shared__ unsigned char smem_raw[];
