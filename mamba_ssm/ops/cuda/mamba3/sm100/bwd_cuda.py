@@ -12,6 +12,8 @@
 See bwd_tc.cu for the math. States are stored per 32-token sub-block in bf16 (TileLang: per 16-token chunk).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -119,7 +121,69 @@ def _scan_c(LOC, TOT, FIRST, LAST, CIN, OUT, H, NB, N: tl.constexpr, P: tl.const
             tl.store(OUT + (b * H + h).to(tl.int64) * N * P + o, x.to(tl.bfloat16))
 
 
+@triton.jit
+def _scan_fused(LOC, TOT, FIRST, LAST, OUT, INC, FLAG, H, NB, NG, NBLK, N: tl.constexpr, P: tl.constexpr,
+                NBR: tl.constexpr, GS: tl.constexpr, REV: tl.constexpr):
+    """One pass of the two-level scan (chained, deterministic): program (chain c = (h, row block), group g) scans its
+    GS sub-blocks from zero (affine map A, T), waits for the value leaving group g - 1 of its chain (INC, published
+    with a release flag), publishes its own (A x_in + T: same arithmetic, same order as _scan_b) and re-scans its
+    sub-blocks from x_in (their rows are still in L2), writing OUT. The groups are the slow grid dimension, so a
+    program only waits for programs dispatched before it (forward progress) and the chains advance together."""
+    c = tl.program_id(0)
+    g = tl.program_id(1)
+    h = c % H
+    nb = c // H
+    o = (nb * NBR + tl.arange(0, NBR))[:, None] * P + tl.arange(0, P)[None, :]
+    x = tl.zeros([NBR, P], dtype=tl.float32)
+    A = 1.0
+    for i in tl.range(0, GS, num_stages=3):
+        j = g * GS + i
+        if j < NB:
+            m, src = _scan_coef(TOT, FIRST, LAST, H, NB, h, j, REV)
+            u = tl.load(LOC + (tl.maximum(src, 0) * H + h).to(tl.int64) * N * P + o, mask=(src >= 0) & (o >= 0), other=0.0).to(tl.float32)
+            x = m * x + u
+            A = A * m
+    cin = tl.zeros([NBR, P], dtype=tl.float32)
+    if g > 0:
+        fprev = FLAG + (g - 1) * (H * NBLK) + c
+        while tl.atomic_add(fprev, 0, sem="acquire") == 0:
+            pass
+        cin = tl.load(INC + ((g - 1) * (H * NBLK) + c).to(tl.int64) * NBR * P + o - nb * NBR * P, volatile=True)
+    if g + 1 < NG:
+        tl.store(INC + (g * (H * NBLK) + c).to(tl.int64) * NBR * P + o - nb * NBR * P, A * cin + x)
+        tl.debug_barrier()
+        tl.atomic_xchg(FLAG + g * (H * NBLK) + c, 1, sem="release")
+    x = cin
+    for i in tl.range(0, GS, num_stages=3):
+        j = g * GS + i
+        if j < NB:
+            m, src = _scan_coef(TOT, FIRST, LAST, H, NB, h, j, REV)
+            u = tl.load(LOC + (tl.maximum(src, 0) * H + h).to(tl.int64) * N * P + o, mask=(src >= 0) & (o >= 0), other=0.0).to(tl.float32)
+            x = m * x + u
+            b = (NB - 1 - j) if REV else j
+            tl.store(OUT + (b * H + h).to(tl.int64) * N * P + o, x.to(tl.bfloat16))
+
+
+_FUSED_SCAN = os.environ.get("M3_FUSED_SCAN", "1") != "0"
+_SCAN_NBR = int(os.environ.get("M3_SCAN_NBR", "32"))
+_SCAN_NW = int(os.environ.get("M3_SCAN_NW", "4"))
+_SCAN_GS = int(os.environ.get("M3_SCAN_GS", str(GS)))
+
+
 def _state_scan(loc, tot, first, last, out, NB, H, rev):
+    if _FUSED_SCAN:
+        NG = triton.cdiv(NB, _SCAN_GS)
+        NBR = _SCAN_NBR
+        nblk = N // NBR
+        inc = torch.empty(max(NG - 1, 1), H * nblk, NBR, P, device=loc.device, dtype=torch.float32)
+        flag = torch.zeros(NG, H * nblk, device=loc.device, dtype=torch.int32)
+        _scan_fused[(H * nblk, NG)](loc, tot, first, last, out, inc, flag, H, NB, NG, nblk, N=N, P=P, NBR=NBR,
+                                    GS=_SCAN_GS, REV=rev, num_warps=_SCAN_NW)
+        return
+    _state_scan_2l(loc, tot, first, last, out, NB, H, rev)
+
+
+def _state_scan_2l(loc, tot, first, last, out, NB, H, rev):
     NG = triton.cdiv(NB, GS)
     NBR = 16
     nblk = N // NBR
