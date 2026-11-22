@@ -816,17 +816,25 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
           tmem_wait_ld();
           float dth[JW], bx[4][JW];
 #pragma unroll
-          for (int e = 0; e < JW; ++e) {
+          for (int e = 0; e < JW; e += 2) {  // column pairs in packed fp32
             const int j = JW * cq + e;
-            const float c = S.cs[tok * NQP + j], s = S.sn[tok * NQP + j];
-            const float a0 = d0[e], a1 = d1[e];
-            bx[0][e] = okr ? c * a0 + s * a1 : 0.f;
-            bx[1][e] = okr ? c * a1 - s * a0 : 0.f;
-            bx[2][e] = okr ? p0v[e] : 0.f;
-            bx[3][e] = okr ? p1v[e] : 0.f;
-            dth[e] = a1 * xh0[e] - a0 * xh1[e];
+            const float2 c = make_float2(S.cs[tok * NQP + j], S.cs[tok * NQP + j + 1]);
+            const float2 sn = make_float2(S.sn[tok * NQP + j], S.sn[tok * NQP + j + 1]);
+            const float2 a0 = make_float2(d0[e], d0[e + 1]), a1 = make_float2(d1[e], d1[e + 1]);
+            const float2 na0 = make_float2(-a0.x, -a0.y);
+            float2 r0 = __ffma2_rn(sn, a1, __fmul2_rn(c, a0));   // c a0 + s a1
+            float2 r1 = __ffma2_rn(sn, na0, __fmul2_rn(c, a1));  // c a1 - s a0
+            float2 r2 = make_float2(p0v[e], p0v[e + 1]), r3 = make_float2(p1v[e], p1v[e + 1]);
+            if (!okr) r0 = r1 = r2 = r3 = make_float2(0.f, 0.f);
+            const float2 th = __ffma2_rn(na0, make_float2(xh1[e], xh1[e + 1]), __fmul2_rn(a1, make_float2(xh0[e], xh0[e + 1])));
+            bx[0][e] = r0.x; bx[0][e + 1] = r0.y; bx[1][e] = r1.x; bx[1][e + 1] = r1.y;
+            bx[2][e] = r2.x; bx[2][e + 1] = r2.y; bx[3][e] = r3.x; bx[3][e + 1] = r3.y;
+            dth[e] = th.x; dth[e + 1] = th.y;
 #pragma unroll
-            for (int x = 0; x < 4; ++x) dxa[x][e] += bx[x][e];
+            for (int x = 0; x < 4; ++x) {
+              const float2 acc = __fadd2_rn(make_float2(dxa[x][e], dxa[x][e + 1]), make_float2(bx[x][e], bx[x][e + 1]));
+              dxa[x][e] = acc.x; dxa[x][e + 1] = acc.y;
+            }
           }
           static_assert(JW == 8, "reduce-scatter layout");
           rs_step<8, 1>(dth, lane);  // over the ranks: pairs JW cq + 4 (rank & 1) + 2 (rank >> 1) + [0, 2)
