@@ -566,6 +566,7 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
         tmem_ldw<GW>(tl + TM_A + cb, g);
         tmem_ldw<GW>(tl + TM_B + cb, d);
         tmem_wait_ld();
+        STAMP(15);
         uint32_t pg[GW / 2], pd[GW / 2];
         float xf[GW / 4];  // per column token: sum over its ranks of A[t][s] times dec[s][t] (trapezoid factor, intra)
         const float lt = ellv[tok];
@@ -586,6 +587,7 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
           pg[e >> 1] = pack_bf16(gw0.x, gw0.y); pg[(e >> 1) + 1] = pack_bf16(gw1.x, gw1.y);
           pd[e >> 1] = pack_bf16(dw0.x, dw0.y); pd[(e >> 1) + 1] = pack_bf16(dw1.x, dw1.y);
         }
+        STAMP(9);
 #pragma unroll
         for (int m = 0; m < GW / 8; ++m) {  // 8-column chunks of the K-major [t][s] tiles (two 64-column halves)
           const int cc = (cb >> 3) + m;
@@ -593,6 +595,7 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
           *reinterpret_cast<uint4*>(&S.gw[off]) = make_uint4(pg[4 * m], pg[4 * m + 1], pg[4 * m + 2], pg[4 * m + 3]);
           *reinterpret_cast<uint4*>(&dpw[off]) = make_uint4(pd[4 * m], pd[4 * m + 1], pd[4 * m + 2], pd[4 * m + 3]);
         }
+        STAMP(10);
         // column sums over the rows t: reduce-scatter over the lanes, then the lanes of equal (lane & 7) sum the rest
         static_assert(GW / 4 == 8, "reduce-scatter layout");
         rs_step<8, 1>(xf, lane);
@@ -610,17 +613,23 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
       __syncthreads();
       // ---------------------------------------------------------------- second products
       if (tid == 0) {  // q: O2 first (the outputs wait for it), then the dq chain
-        constexpr uint32_t ID_O = idesc(128, 64, 0, 1), ID_X = idesc(128, 128, 0, 1);
+        constexpr uint32_t ID_O = idesc(128, 64, 0, 1);
         tc_fence_after();
 #pragma unroll
         for (int kk = 0; kk < 8; ++kk)  // O2 = (G W) PsiV
           umma(tmem + TM_O2, kdesc(&S.gw[(kk >> 2) * TILE + (kk & 3) * 16]), mdesc(&S.pv[kk * 16 * 64]), ID_O, kk > 0);
         umma_commit(&S.m2a);
+      }
+      mbar_wait(&S.m2a, ph);
+      tc_fence_after();
+      STAMP(7);
+      if (tid == 0) {  // the dq chain and the kv products run under the q-side epilogues
+        constexpr uint32_t ID_X = idesc(128, 128, 0, 1);
 #pragma unroll
         for (int kk = 0; kk < 8; ++kk)  // dq += (dP W) khat
           umma(tmem + TM_D, kdesc(&dpw[(kk >> 2) * TILE + (kk & 3) * 16]), mdesc(&S.k[kk * 16 * 64]), ID_X, 1);
         umma_commit(&S.m2b);
-      } else if (tid == 384) {  // kv, right away: dPsi2 = (G W)^T dO, dk = xk D^T + (dP W)^T qhat
+      } else if (tid == 384) {  // kv: dPsi2 = (G W)^T dO, dk = xk D^T + (dP W)^T qhat
         constexpr uint32_t ID_T = idesc(128, 64, 1, 1), ID_TT = idesc(128, 128, 1, 1), ID_I = idesc(128, 128, 0, 0);
         tc_fence_after();
 #pragma unroll
@@ -632,9 +641,6 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
         for (int kk = 0; kk < 8; ++kk) umma(tmem + TM_DK, mdesc(&dpw[kk * 16 * 64]), mdesc(&S.q[kk * 16 * 64]), ID_TT, 1);
         umma_commit(&S.mk1);
       }
-      mbar_wait(&S.m2a, ph);
-      tc_fence_after();
-      STAMP(7);
       // ---------------------------------------------------------------- the two sides' epilogues
       auto side = [&](auto side_tag, float (&dxa)[4][JW]) {
         constexpr int SD = decltype(side_tag)::value;
@@ -819,7 +825,7 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
           }
         }
         S.red[2][cq][row] = sc3;
-        STAMP(QS ? 9 : 13);
+        if (!QS) STAMP(13);
         __syncthreads();
         if (cq == 0) {  // per-token sums (sum over the column groups, then over the ranks)
           float v1 = 0.f, v2 = 0.f;
@@ -868,7 +874,7 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
         }
         tc_fence_before();
         __syncthreads();
-        STAMP(QS ? 10 : 14);
+        if (!QS) STAMP(14);
         if (!QS && tid == 0) {  // fixed order (deterministic)
           float c = 0.f;
 #pragma unroll
