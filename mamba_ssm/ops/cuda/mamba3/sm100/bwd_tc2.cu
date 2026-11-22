@@ -614,17 +614,16 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
         for (int kk = 0; kk < 8; ++kk)  // O2 = (G W) PsiV
           umma(tmem + TM_O2, kdesc(&S.gw[(kk >> 2) * TILE + (kk & 3) * 16]), mdesc(&S.pv[kk * 16 * 64]), ID_O, kk > 0);
         umma_commit(&S.m2a);
+        constexpr uint32_t ID_X = idesc(128, 128, 0, 1);
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk)  // dq += (dP W) khat, queued behind O2
+          umma(tmem + TM_D, kdesc(&dpw[(kk >> 2) * TILE + (kk & 3) * 16]), mdesc(&S.k[kk * 16 * 64]), ID_X, 1);
+        umma_commit(&S.m2b);
       }
       mbar_wait(&S.m2a, ph);
       tc_fence_after();
       STAMP(7);
-      if (tid == 0) {  // the dq chain and the kv products run under the q-side epilogues
-        constexpr uint32_t ID_X = idesc(128, 128, 0, 1);
-#pragma unroll
-        for (int kk = 0; kk < 8; ++kk)  // dq += (dP W) khat
-          umma(tmem + TM_D, kdesc(&dpw[(kk >> 2) * TILE + (kk & 3) * 16]), mdesc(&S.k[kk * 16 * 64]), ID_X, 1);
-        umma_commit(&S.m2b);
-      } else if (tid == 384) {  // kv: dPsi2 = (G W)^T dO, dk = xk D^T + (dP W)^T qhat
+      if (tid == 384) {  // kv: dPsi2 = (G W)^T dO, dk = xk D^T + (dP W)^T qhat
         constexpr uint32_t ID_T = idesc(128, 64, 1, 1), ID_TT = idesc(128, 128, 1, 1), ID_I = idesc(128, 128, 0, 0);
         tc_fence_after();
 #pragma unroll
