@@ -484,55 +484,47 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
           umma_commit(&S.m1);
         }
       }
-      // PsiV, dO -> pv / dob; dO exp(l), PsiV exp(l_end - l) f staged in gw (they go to tensor memory below)
-      static_assert(THREADS % 32 == 0 && (ROWS * 8) % THREADS == 0, "fixed rank / piece per thread");
-      float cmv[8], cmo[8], cmz[8];
+      // PsiV, dO -> pv / dob, in the epilogue geometry (row, 16 columns): dO exp(l) and PsiV exp(l_end - l) f go
+      // straight to this thread's tensor-memory lanes (bf16 pairs, A operands of the state parts of dq / dk)
       {
-        const int rk = (tid >> 3) & 3, p0 = 8 * (tid & 7);
-        *reinterpret_cast<float4*>(cmv) = *reinterpret_cast<const float4*>(&mvv[rk * PP + p0]);
-        *reinterpret_cast<float4*>(cmv + 4) = *reinterpret_cast<const float4*>(&mvv[rk * PP + p0 + 4]);
-        *reinterpret_cast<float4*>(cmo) = *reinterpret_cast<const float4*>(&mov[rk * PP + p0]);
-        *reinterpret_cast<float4*>(cmo + 4) = *reinterpret_cast<const float4*>(&mov[rk * PP + p0 + 4]);
-        *reinterpret_cast<float4*>(cmz) = *reinterpret_cast<const float4*>(&mzv[rk * PP + p0]);
-        *reinterpret_cast<float4*>(cmz + 4) = *reinterpret_cast<const float4*>(&mzv[rk * PP + p0 + 4]);
-      }
-#pragma unroll
-      for (int u = tid; u < ROWS * 8; u += THREADS) {
-        const int r_ = u >> 3, ci = u & 7, tk = r_ >> 2, p0 = 8 * ci;
-        const bool ok = tk < nv;
-        U8 vv, dd, zz, o1, o2, o3, o4;
-        vv.u = *reinterpret_cast<const uint4*>(&S.v[swz(tk, p0)]);
-        dd.u = *reinterpret_cast<const uint4*>(&S.dy[swz(tk, p0)]);
-        zz.u = *reinterpret_cast<const uint4*>(&S.z[swz(tk, p0)]);
-        const float eq = ok ? __expf(ellv[tk]) : 0.f;
-        const float ek = ok ? __expf(totv - ellv[tk]) * ffv[tk] : 0.f;
-#pragma unroll
-        for (int e = 0; e < 8; e += 2) {  // column pairs in packed fp32
-          const int e2 = e >> 1;
-          const float2 cv = make_float2(cmv[e], cmv[e + 1]), cz = make_float2(cmz[e], cmz[e + 1]);
-          const float2 co = make_float2(cmo[e], cmo[e + 1]);
-          float2 ps = __fmul2_rn(__bfloat1622float2(vv.h2[e2]), cv);
-          const float2 zm = __fmul2_rn(__bfloat1622float2(zz.h2[e2]), cz);
-          float2 dO = __fmul2_rn(__fmul2_rn(__bfloat1622float2(dd.h2[e2]), co), make_float2(silu_f(zm.x), silu_f(zm.y)));
-          if (!ok) { ps = make_float2(0.f, 0.f); dO = make_float2(0.f, 0.f); }
-          const float2 ek2 = make_float2(ek, ek), eq2 = make_float2(eq, eq);
-          o1.h2[e2] = __float22bfloat162_rn(ps);
-          o2.h2[e2] = __float22bfloat162_rn(dO);
-          o3.h2[e2] = __float22bfloat162_rn(__fmul2_rn(dO, eq2));
-          o4.h2[e2] = __float22bfloat162_rn(__fmul2_rn(ps, ek2));
-        }
-        *reinterpret_cast<uint4*>(&S.pv[swz(r_, p0)]) = o1.u;
-        *reinterpret_cast<uint4*>(&S.dob[swz(r_, p0)]) = o2.u;
-        *reinterpret_cast<uint4*>(&S.gw[swz(r_, p0)]) = o3.u;
-        *reinterpret_cast<uint4*>(&S.gw[TILE + swz(r_, p0)]) = o4.u;
-      }
-      __syncthreads();
-      {  // xq, xk -> tensor memory (bf16 pairs, A operands of the state parts of dq / dk)
+        const int p0 = OW * cq;
+        const float eq = okr ? __expf(ellv[tok]) : 0.f;
+        const float ek = okr ? __expf(totv - ellv[tok]) * ffv[tok] : 0.f;
+        const float2 ek2 = make_float2(ek, ek), eq2 = make_float2(eq, eq);
         uint32_t xq8[8], xk8[8];
-        *reinterpret_cast<uint4*>(&xq8[0]) = *reinterpret_cast<const uint4*>(&S.gw[swz(row, OW * cq)]);
-        *reinterpret_cast<uint4*>(&xq8[4]) = *reinterpret_cast<const uint4*>(&S.gw[swz(row, OW * cq + 8)]);
-        *reinterpret_cast<uint4*>(&xk8[0]) = *reinterpret_cast<const uint4*>(&S.gw[TILE + swz(row, OW * cq)]);
-        *reinterpret_cast<uint4*>(&xk8[4]) = *reinterpret_cast<const uint4*>(&S.gw[TILE + swz(row, OW * cq + 8)]);
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+          const int pc = p0 + 8 * hf;
+          U8 vv, dd, zz, o1, o2;
+          vv.u = *reinterpret_cast<const uint4*>(&S.v[swz(tok, pc)]);
+          dd.u = *reinterpret_cast<const uint4*>(&S.dy[swz(tok, pc)]);
+          zz.u = *reinterpret_cast<const uint4*>(&S.z[swz(tok, pc)]);
+          float cmv[8], cmo[8], cmz[8];
+          *reinterpret_cast<float4*>(cmv) = *reinterpret_cast<const float4*>(&mvv[rank * PP + pc]);
+          *reinterpret_cast<float4*>(cmv + 4) = *reinterpret_cast<const float4*>(&mvv[rank * PP + pc + 4]);
+          *reinterpret_cast<float4*>(cmo) = *reinterpret_cast<const float4*>(&mov[rank * PP + pc]);
+          *reinterpret_cast<float4*>(cmo + 4) = *reinterpret_cast<const float4*>(&mov[rank * PP + pc + 4]);
+          *reinterpret_cast<float4*>(cmz) = *reinterpret_cast<const float4*>(&mzv[rank * PP + pc]);
+          *reinterpret_cast<float4*>(cmz + 4) = *reinterpret_cast<const float4*>(&mzv[rank * PP + pc + 4]);
+#pragma unroll
+          for (int e = 0; e < 8; e += 2) {  // column pairs in packed fp32
+            const int e2 = e >> 1;
+            const float2 cv = make_float2(cmv[e], cmv[e + 1]), cz = make_float2(cmz[e], cmz[e + 1]);
+            const float2 co = make_float2(cmo[e], cmo[e + 1]);
+            float2 ps = __fmul2_rn(__bfloat1622float2(vv.h2[e2]), cv);
+            const float2 zm = __fmul2_rn(__bfloat1622float2(zz.h2[e2]), cz);
+            float2 dO = __fmul2_rn(__fmul2_rn(__bfloat1622float2(dd.h2[e2]), co), make_float2(silu_f(zm.x), silu_f(zm.y)));
+            if (!okr) { ps = make_float2(0.f, 0.f); dO = make_float2(0.f, 0.f); }
+            o1.h2[e2] = __float22bfloat162_rn(ps);
+            o2.h2[e2] = __float22bfloat162_rn(dO);
+            const __nv_bfloat162 xq2 = __float22bfloat162_rn(__fmul2_rn(dO, eq2));
+            const __nv_bfloat162 xk2 = __float22bfloat162_rn(__fmul2_rn(ps, ek2));
+            xq8[4 * hf + e2] = *reinterpret_cast<const uint32_t*>(&xq2);
+            xk8[4 * hf + e2] = *reinterpret_cast<const uint32_t*>(&xk2);
+          }
+          *reinterpret_cast<uint4*>(&S.pv[swz(row, pc)]) = o1.u;
+          *reinterpret_cast<uint4*>(&S.dob[swz(row, pc)]) = o2.u;
+        }
         tmem_st8(tl + TM_XQ + (OW / 2) * cq, xq8);
         tmem_st8(tl + TM_XK + (OW / 2) * cq, xk8);
         tmem_wait_st();
