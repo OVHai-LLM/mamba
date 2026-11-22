@@ -660,13 +660,16 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc2_kernel(const __grid_consta
             U8 pv, dd, ry, rz, rv;
             pv.u = *reinterpret_cast<const uint4*>(&S.pv[swz(row, p0)]);
             dd.u = *reinterpret_cast<const uint4*>(&S.dob[swz(row, p0)]);
-            float cmo[8], cmz[8], cmv[8];
-            *reinterpret_cast<float4*>(cmo) = *reinterpret_cast<const float4*>(&mov[rank * PP + p0]);
-            *reinterpret_cast<float4*>(cmo + 4) = *reinterpret_cast<const float4*>(&mov[rank * PP + p0 + 4]);
-            *reinterpret_cast<float4*>(cmz) = *reinterpret_cast<const float4*>(&mzv[rank * PP + p0]);
-            *reinterpret_cast<float4*>(cmz + 4) = *reinterpret_cast<const float4*>(&mzv[rank * PP + p0 + 4]);
-            *reinterpret_cast<float4*>(cmv) = *reinterpret_cast<const float4*>(&mvv[rank * PP + p0]);
-            *reinterpret_cast<float4*>(cmv + 4) = *reinterpret_cast<const float4*>(&mvv[rank * PP + p0 + 4]);
+            float cmo[8], cmz[8], cmv[8];  // q side: mimo_o, mimo_z; kv side: mimo_v
+            if (QS) {
+              *reinterpret_cast<float4*>(cmo) = *reinterpret_cast<const float4*>(&mov[rank * PP + p0]);
+              *reinterpret_cast<float4*>(cmo + 4) = *reinterpret_cast<const float4*>(&mov[rank * PP + p0 + 4]);
+              *reinterpret_cast<float4*>(cmz) = *reinterpret_cast<const float4*>(&mzv[rank * PP + p0]);
+              *reinterpret_cast<float4*>(cmz + 4) = *reinterpret_cast<const float4*>(&mzv[rank * PP + p0 + 4]);
+            } else {
+              *reinterpret_cast<float4*>(cmv) = *reinterpret_cast<const float4*>(&mvv[rank * PP + p0]);
+              *reinterpret_cast<float4*>(cmv + 4) = *reinterpret_cast<const float4*>(&mvv[rank * PP + p0 + 4]);
+            }
             if (QS) {
               ry.u = *reinterpret_cast<const uint4*>(&S.dy[swz(tok, p0)]);
               rz.u = *reinterpret_cast<const uint4*>(&S.z[swz(tok, p0)]);
