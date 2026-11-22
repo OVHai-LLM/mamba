@@ -484,14 +484,15 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
           const float* cp = &S.cs[tk * NQP + cA];
           const float* sp = &S.sn[tk * NQP + cA];
 #pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            const float c_a = cp[2 * j], c_b = cp[2 * j + 1], s_a = sp[2 * j], s_b = sp[2 * j + 1];
+          for (int j = 0; j < 4; ++j) {  // rotations in packed fp32 (column pairs)
+            const float2 c2 = make_float2(cp[2 * j], cp[2 * j + 1]), s2 = make_float2(sp[2 * j], sp[2 * j + 1]);
+            const float2 ns2 = make_float2(-s2.x, -s2.y);
             const float2 x0 = __bfloat1622float2(qv[0].h2[j]), x1 = __bfloat1622float2(qv[1].h2[j]);
             const float2 y0 = __bfloat1622float2(kv[0].h2[j]), y1 = __bfloat1622float2(kv[1].h2[j]);
-            qv[0].h2[j] = __floats2bfloat162_rn(c_a * x0.x - s_a * x1.x, c_b * x0.y - s_b * x1.y);
-            qv[1].h2[j] = __floats2bfloat162_rn(s_a * x0.x + c_a * x1.x, s_b * x0.y + c_b * x1.y);
-            kv[0].h2[j] = __floats2bfloat162_rn(c_a * y0.x - s_a * y1.x, c_b * y0.y - s_b * y1.y);
-            kv[1].h2[j] = __floats2bfloat162_rn(s_a * y0.x + c_a * y1.x, s_b * y0.y + c_b * y1.y);
+            qv[0].h2[j] = __float22bfloat162_rn(__ffma2_rn(ns2, x1, __fmul2_rn(c2, x0)));
+            qv[1].h2[j] = __float22bfloat162_rn(__ffma2_rn(c2, x1, __fmul2_rn(s2, x0)));
+            kv[0].h2[j] = __float22bfloat162_rn(__ffma2_rn(ns2, y1, __fmul2_rn(c2, y0)));
+            kv[1].h2[j] = __float22bfloat162_rn(__ffma2_rn(c2, y1, __fmul2_rn(s2, y0)));
           }
           if (!ok) {
 #pragma unroll
@@ -539,18 +540,23 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
         const float eq = ok ? __expf(ellv[tk]) : 0.f;
         const float ek = ok ? __expf(totv - ellv[tk]) * ffv[tk] : 0.f;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-          const float ps = ok ? __bfloat162float(vv.h[e]) * cmv[e] : 0.f;
-          const float zm = __bfloat162float(zz.h[e]) * cmz[e];
-          const float dO = ok ? __bfloat162float(dd.h[e]) * cmo[e] * silu_f(zm) : 0.f;
+        for (int e = 0; e < 8; e += 2) {  // column pairs in packed fp32
+          const int e2 = e >> 1;
+          const float2 cv = make_float2(cmv[e], cmv[e + 1]), cz = make_float2(cmz[e], cmz[e + 1]);
+          const float2 co = make_float2(cmo[e], cmo[e + 1]);
+          float2 ps = __fmul2_rn(__bfloat1622float2(vv.h2[e2]), cv);
+          const float2 zm = __fmul2_rn(__bfloat1622float2(zz.h2[e2]), cz);
+          float2 dO = __fmul2_rn(__fmul2_rn(__bfloat1622float2(dd.h2[e2]), co), make_float2(silu_f(zm.x), silu_f(zm.y)));
+          if (!ok) { ps = make_float2(0.f, 0.f); dO = make_float2(0.f, 0.f); }
+          const float2 ek2 = make_float2(ek, ek), eq2 = make_float2(eq, eq);
           if (MODE == MODE_LOCAL) {
-            o1.h[e] = __float2bfloat16(ps * ek);
-            o2.h[e] = __float2bfloat16(dO * eq);
+            o1.h2[e2] = __float22bfloat162_rn(__fmul2_rn(ps, ek2));
+            o2.h2[e2] = __float22bfloat162_rn(__fmul2_rn(dO, eq2));
           } else {
-            o1.h[e] = __float2bfloat16(ps);
-            o2.h[e] = __float2bfloat16(dO);
-            o3.h[e] = __float2bfloat16(dO * eq);
-            o4.h[e] = __float2bfloat16(ps * ek);
+            o1.h2[e2] = __float22bfloat162_rn(ps);
+            o2.h2[e2] = __float22bfloat162_rn(dO);
+            o3.h2[e2] = __float22bfloat162_rn(__fmul2_rn(dO, eq2));
+            o4.h2[e2] = __float22bfloat162_rn(__fmul2_rn(ps, ek2));
           }
         }
         *reinterpret_cast<uint4*>(&S.pv[swz(r_, p0)]) = o1.u;
