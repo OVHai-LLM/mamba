@@ -99,3 +99,16 @@ def test_sm100_falls_back_outside_the_olala_configuration():
     assert not config_ok(*args[:11], True, *args[12:])             # fused pre-gate RMSNorm
     assert not config_ok(*args[:12], None, False)                   # dense (non-varlen) layout
     assert not config_ok(q, k, v, H, None, *args[5:])               # no MIMO_Out reduction
+
+
+def test_sm100_head_broadcast_angles_view_matches_materialized():
+    """Angles broadcast over the heads (stride-0 head view, as Dragon's glue passes them) are read in place by the
+    sm100 path: same output and gradients as the materialized tensor."""
+    x, cu = _inputs(LENS)
+    base = x["Angles"][:, :, :1].contiguous()
+    dout = torch.randn_like(x["V"])
+    o1, g1 = _run({**x, "Angles": base.expand(-1, -1, H, -1).contiguous()}, cu, dout, sm100=True)
+    o2, g2 = _run({**x, "Angles": base.expand(-1, -1, H, -1)}, cu, dout, sm100=True)
+    assert torch.equal(o1, o2)
+    for name in NAMES:
+        assert torch.equal(g1[name], g2[name]), name
