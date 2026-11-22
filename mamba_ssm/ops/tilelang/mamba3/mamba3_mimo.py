@@ -128,6 +128,10 @@ class _Mamba3Function(torch.autograd.Function):
             Out, Angles_Cumsum, Angle_Base = fwd_tc.fwd(Q, K, V, Q_bias, K_bias, MIMO_V, MIMO_Out, Z, D, MIMO_Z, Angles,
                                                         ADT, DT, Trap, cu_host_list(cu_seqlens))
         else:
+            if Angles.dim() == 4 and Angles.shape[0] == 1:
+                # the TileLang kernels check strides strictly: a contiguous B=1 tensor may carry a collapsed batch
+                # stride (e.g. a clone of a head-broadcast view)
+                Angles = Angles.as_strided(Angles.shape, (Angles[0].numel(), *Angles.stride()[1:]))
             # Compute cumulative angles (varlen-aware)
             Angles_Cumsum, angle_output_state = angle_dt_fwd(
                 Angles, DT,

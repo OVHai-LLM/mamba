@@ -618,7 +618,9 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
 #pragma unroll
           for (int e = 0; e < GW; e += 2) {
             const int ts = (cb + e) >> 2;  // both columns of the pair belong to the same token
-            const float A0 = g[e] * d[e], A1 = g[e + 1] * d[e + 1];
+            const float2 gg = make_float2(g[e], g[e + 1]), dd = make_float2(d[e], d[e + 1]);
+            const float2 AA = __fmul2_rn(gg, dd);  // packed fp32 (same rounding as two FMULs)
+            const float A0 = AA.x, A1 = AA.y;
             float w;
             if (QS) {
               w = S.tab1[tok * CP + ts];             // W[t = row][s = col]
@@ -628,8 +630,9 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
               w = S.tab1[ts * CP + tok];             // W[t = col][s = row]
               acc1 += (A0 + A1) * S.tab2[tok * CP + ts];
             }
-            pg[e >> 1] = pack_bf16(g[e] * w, g[e + 1] * w);
-            pd[e >> 1] = pack_bf16(d[e] * w, d[e + 1] * w);
+            const float2 ww = make_float2(w, w), gw = __fmul2_rn(gg, ww), dw = __fmul2_rn(dd, ww);
+            pg[e >> 1] = pack_bf16(gw.x, gw.y);
+            pd[e >> 1] = pack_bf16(dw.x, dw.y);
           }
           tmem_stw<GW / 2>(tl + TM_A + (cb >> 1), pg);
           tmem_stw<GW / 2>(tl + TM_B + (cb >> 1), pd);
@@ -708,26 +711,46 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
               rv.u = *reinterpret_cast<const uint4*>(&S.v[rb][swz(tok, p0)]);
             }
 #pragma unroll
-            for (int e = 0; e < 8; ++e) {
+            for (int e = 0; e < 8; e += 2) {  // column pairs in packed fp32 (FMUL2 / FFMA2)
               const int i = 8 * ch + e;
-              const float ps = __bfloat162float(pv.h[e]), dO = __bfloat162float(dd.h[e]);
+              const float2 ps = __bfloat1622float2(pv.h2[e >> 1]), dO = __bfloat1622float2(dd.h2[e >> 1]);
+              const float2 o1v = make_float2(o1[i], o1[i + 1]), o2v = make_float2(o2[i], o2[i + 1]);
+              const float2 dsk2 = make_float2(dskv, dskv);
               if (QS) {
-                const float o = eq * o1[i] + o2[i] + dskv * ps;   // pre-gate output (recomputed)
-                sc3 += eq * o1[i] * dO;                          // inter part of the decay row sum
-                const float y = okr ? __bfloat162float(ry.h[e]) : 0.f, zv = __bfloat162float(rz.h[e]);
-                const float zz = zv * cmz[e], sg = 1.f / (1.f + __expf(-zz));
-                const float dzz = y * cmo[e] * o * sg * (1.f + zz * (1.f - sg));
-                g1[i] = y * zz * sg * o;   // dmimo_o
-                g2[i] = dzz * zv;          // dmimo_z
-                dz[i] = dzz * cmz[e];      // dz (summed over the ranks below)
+                const float2 eq2 = make_float2(eq, eq);
+                const float2 eo1 = __fmul2_rn(eq2, o1v);
+                const float2 o = __ffma2_rn(dsk2, ps, __fadd2_rn(eo1, o2v));   // pre-gate output (recomputed)
+                const float2 sr = __fmul2_rn(eo1, dO);                          // inter part of the decay row sum
+                sc3 += sr.x + sr.y;
+                const float2 y = okr ? __bfloat1622float2(ry.h2[e >> 1]) : make_float2(0.f, 0.f);
+                const float2 zv = __bfloat1622float2(rz.h2[e >> 1]);
+                const float2 cz = make_float2(cmz[e], cmz[e + 1]), co = make_float2(cmo[e], cmo[e + 1]);
+                const float2 zz = __fmul2_rn(zv, cz);
+                const float2 sg = make_float2(1.f / (1.f + __expf(-zz.x)), 1.f / (1.f + __expf(-zz.y)));
+                const float2 one = make_float2(1.f, 1.f);
+                const float2 inner = __ffma2_rn(zz, __fadd2_rn(one, make_float2(-sg.x, -sg.y)), one);  // 1 + zz (1 - sg)
+                const float2 yos = __fmul2_rn(__fmul2_rn(y, o), sg);
+                const float2 dzz = __fmul2_rn(__fmul2_rn(yos, co), inner);
+                const float2 gg1 = __fmul2_rn(yos, zz);   // dmimo_o
+                const float2 gg2 = __fmul2_rn(dzz, zv);   // dmimo_z
+                const float2 ddz = __fmul2_rn(dzz, cz);   // dz (summed over the ranks below)
+                g1[i] = gg1.x; g1[i + 1] = gg1.y;
+                g2[i] = gg2.x; g2[i + 1] = gg2.y;
+                dz[i] = ddz.x; dz[i + 1] = ddz.y;
               } else {
-                const float dps = okr ? ek * o1[i] + o2[i] + dskv * dO : 0.f;  // dPsiV
-                sc3 += ek0 * o1[i] * ps;                                     // kD . PsiV (factor gradient)
-                const float vv = okr ? __bfloat162float(rv.h[e]) : 0.f;
-                g1[i] = dps * vv;          // dmimo_v
-                g2[i] = 0.f;
-                dz[i] = dps * cmv[e];      // dv (summed over the ranks below)
-                pdl += dO * ps;            // dD
+                const float2 ek2 = make_float2(ek, ek), ek02 = make_float2(ek0, ek0);
+                float2 dps = __ffma2_rn(dsk2, dO, __ffma2_rn(ek2, o1v, o2v));  // dPsiV
+                if (!okr) dps = make_float2(0.f, 0.f);
+                const float2 sr = __fmul2_rn(__fmul2_rn(ek02, o1v), ps);       // kD . PsiV (factor gradient)
+                sc3 += sr.x + sr.y;
+                const float2 vv = okr ? __bfloat1622float2(rv.h2[e >> 1]) : make_float2(0.f, 0.f);
+                const float2 gg1 = __fmul2_rn(dps, vv);   // dmimo_v
+                const float2 ddv = __fmul2_rn(dps, make_float2(cmv[e], cmv[e + 1]));  // dv (summed over the ranks below)
+                const float2 pd = __fmul2_rn(dO, ps);     // dD
+                g1[i] = gg1.x; g1[i + 1] = gg1.y;
+                g2[i] = 0.f; g2[i + 1] = 0.f;
+                dz[i] = ddv.x; dz[i + 1] = ddv.y;
+                pdl += pd.x + pd.y;
               }
             }
           }
