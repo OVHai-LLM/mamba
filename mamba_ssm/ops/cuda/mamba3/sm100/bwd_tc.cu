@@ -255,8 +255,9 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
   }
   if (tid == 0) {
     mbar_init(&S.tA, 1); mbar_init(&S.tB[0], 1); mbar_init(&S.tB[1], 1);
-    // the first products of a side are issued as independent chains by up to 4 threads (warps 0 / 4 / 8 / 12)
-    mbar_init(&S.m1[0], MODE == MODE_LOCAL ? 2 : 4); mbar_init(&S.m1[1], 3);
+    // m1: the products the masks need (q: G, dP, O1 -- O1 rides along, it is issued with G; kv: GT, dPT); the state
+    // part of dq and kD are committed with the second products of their side by thread 0
+    mbar_init(&S.m1[0], MODE == MODE_LOCAL ? 2 : 3); mbar_init(&S.m1[1], 2);
     for (int i = 0; i < 2; ++i) { mbar_init(&S.m2a[i], 1); mbar_init(&S.m2b[i], 1); }
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
   }
@@ -326,10 +327,8 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
   constexpr int JW = NQ / QC;   // rotated pairs per thread in the dq (dk) epilogue
   constexpr int OW = P / QC;    // O / PsiV columns per thread
 
-  auto issue_m1 = [&](auto side_tag, unsigned parts) {  // all threads: chain `part` (bit of `parts`) issued by thread 128 * part
+  auto issue_part = [&](auto side_tag, int part, bool commit = true) {
     constexpr bool QS = decltype(side_tag)::value == SIDE_Q;
-    const int part = tid >> 7;
-    if ((tid & 127) != 0 || part >= (QS ? 4 : 3) || !((parts >> part) & 1)) return;
     tc_fence_after();
     const __nv_bfloat16* X = QS ? S.q : S.k;
     const __nv_bfloat16* Y = QS ? S.k : S.q;
@@ -352,7 +351,14 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) umma(tmem + TM_D, kdesc(&S.xq[kk * 16]), kdesc(&S.sth[kk * 16]), ID, kk > 0);
     }
-    umma_commit(&S.m1[QS ? SIDE_Q : SIDE_KV]);
+    if (commit) umma_commit(&S.m1[QS ? SIDE_Q : SIDE_KV]);
+  };
+
+  auto issue_m1 = [&](auto side_tag, unsigned parts) {  // all threads: chain `part` (bit of `parts`) issued by thread 128 * part
+    constexpr bool QS = decltype(side_tag)::value == SIDE_Q;
+    const int part = tid >> 7;
+    if ((tid & 127) != 0 || part >= (QS ? 4 : 3) || !((parts >> part) & 1)) return;
+    issue_part(side_tag, part);
   };
 
   // LOCAL epilogue: row = state row n; bf16 tiles staged in sth / std_ (unused by LOCAL, SW128 like the TMA maps),
@@ -588,7 +594,11 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
         const __nv_bfloat16* XE = QS ? S.xq : S.xk;     // dO exp(l)  |  PsiV exp(l_end - l) f
         // ---------------------------------------------------------- first products: G / GT, dP / dPT, O1 / kD (and
         // the state part of dq) -- the kv side's are issued by the q side once its TMEM columns are free
-        if (QS) issue_m1(side_tag, 0b1010u);  // dP, dq state part (G, O1 went during the operand build)
+        if (QS) {  // dP (G, O1 went during the operand build); the state part of dq from thread 0, which also issues
+                   // the rest of the dq chain (committed with it, it is not needed before the dq epilogue)
+          if (tid == 128) issue_part(side_tag, 1);
+          else if (tid == 0) issue_part(side_tag, 3, false);
+        }
         mbar_wait(&S.m1[SD], it & 1);
         tc_fence_after();
         STAMP(4 + 5 * SD);
@@ -632,14 +642,12 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
         STAMP(5 + 5 * SD);
         // ---------------------------------------------------------- second products
         constexpr uint32_t ID_O = idesc(128, 64, 0, 1), ID_X = idesc(128, 128, 0, 1), ID_I = idesc(128, 128, 0, 0);
-        if (tid == 0) {  // O2 chain
+        if (tid == 0) {  // O2 chain first (the outputs wait for it), then the dq (dk) chain behind it
           tc_fence_after();
 #pragma unroll
           for (int kk = 0; kk < 8; ++kk)  // O2 = (G W) PsiV  |  dPsi2 = (GT W^T) dO
             umma_ts(tmem + TM_O2, tmem + TM_A + 8 * kk, mdesc(&RB[kk * 16 * 64]), ID_O, kk > 0);
-          umma_commit(&S.m2a[SD]);
-        } else if (tid == 128) {  // dq (dk) chain, issued in parallel by another warp
-          tc_fence_after();
+          umma_commit(&S.m2a[SD]);  // (kv: also kD, issued by this thread after the q side's outputs)
           if (!QS) {  // dk: (PsiV exp(l_end - l) f) D^T (the q side's state part of dq went with its first products)
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) umma(tmem + TM_D, kdesc(&XE[kk * 16]), kdesc(&ST[kk * 16]), ID_I, kk > 0);
@@ -651,6 +659,8 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
         }
         mbar_wait(&S.m2a[SD], it & 1);
         tc_fence_after();
+        if (QS && tid == 384) issue_part(std::integral_constant<int, SIDE_KV>{}, 0);  // G columns free after O2: GT
+                                                                                    // runs under the output epilogue
         STAMP(6 + 5 * SD);
         // ---------------------------------------------------------- outputs
         float sc3 = 0.f;
@@ -758,7 +768,8 @@ __global__ void __launch_bounds__(THREADS, 1) bwd_tc_kernel(const __grid_constan
         tc_fence_before();
         __syncthreads();
         if (QS) {  // the q side is done with G / dP / O1 / O2: the kv side's first products run under its dq epilogue
-          issue_m1(std::integral_constant<int, SIDE_KV>{}, 0b111u);
+          if (tid == 128) issue_part(std::integral_constant<int, SIDE_KV>{}, 1);  // dPT (GT went after O2)
+          else if (tid == 0) issue_part(std::integral_constant<int, SIDE_KV>{}, 2, false);  // kD, with the kv m2a
         } else {   // Q / K / state tiles are free after the kv products and the reads above
           if (tid == 0 && has_next) issue_a(nb_, nh_);
         }
