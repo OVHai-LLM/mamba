@@ -165,6 +165,8 @@ def _scan_fused(LOC, TOT, FIRST, LAST, OUT, INC, FLAG, H, NB, NG, NBLK, N: tl.co
 
 
 _FUSED_SCAN = os.environ.get("M3_FUSED_SCAN", "1") != "0"
+# M3_BWD_V2=1: the FUSED kernel of bwd_tc2.cu (masked tiles in shared memory, no kv-side GT / dPT products)
+_BWD_V2 = os.environ.get("M3_BWD_V2", "0") == "1"
 _SCAN_NBR = int(os.environ.get("M3_SCAN_NBR", "32"))
 _SCAN_NW = int(os.environ.get("M3_SCAN_NW", "4"))
 _SCAN_GS = int(os.environ.get("M3_SCAN_GS", str(GS)))
@@ -319,8 +321,9 @@ def bwd(dout, q, k, v, q_bias, k_bias, mimo_v, mimo_o, z, mimo_z, angles, adt, d
     dang = torch.empty(1, S, H, NQ, **f32)  # phase gradient, written by the main kernel
     dlrow, dgam, dfac = (torch.empty(1, H, S, **f32) for _ in range(3))
     cross = torch.empty(NB, H, **f32)
-    ext.main(*common, hs, ds, dq, dk, dz.view(S, H, P), dv.view(S, H, P), dang, dlrow, dgam, dfac, acc_q, acc_kv,
-             cross, NB)
+    ext_main = build("mamba3_bwd_tc2", "bwd_tc2.cu") if _BWD_V2 else ext
+    ext_main.main(*common, hs, ds, dq, dk, dz.view(S, H, P), dv.view(S, H, P), dang, dlrow, dgam, dfac, acc_q, acc_kv,
+                  cross, NB)
     del hs, ds
     dadt = torch.empty(1, H, S, **f32)
     ddt = torch.empty(1, H, S, device=dev, dtype=dt.dtype)
