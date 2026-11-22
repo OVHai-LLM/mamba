@@ -321,7 +321,7 @@ def bwd(dout, q, k, v, q_bias, k_bias, mimo_v, mimo_o, z, mimo_z, angles, adt, d
     dang = torch.empty(1, S, H, NQ, **f32)  # phase gradient, written by the main kernel
     dlrow, dgam, dfac = (torch.empty(1, H, S, **f32) for _ in range(3))
     cross = torch.empty(NB, H, **f32)
-    ext_main = build("mamba3_bwd_tc2", "bwd_tc2.cu") if _BWD_V2 else ext
+    ext_main = (build("mamba3_bwd_tc2", "bwd_tc2.cu") or ext) if _BWD_V2 else ext  # V2 build failure: V1 kernel
     ext_main.main(*common, hs, ds, dq, dk, dz.view(S, H, P), dv.view(S, H, P), dang, dlrow, dgam, dfac, acc_q, acc_kv,
                   cross, NB)
     del hs, ds
